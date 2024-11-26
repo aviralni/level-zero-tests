@@ -1,6 +1,6 @@
 /*
  *
- * Copyright (C) 2019 Intel Corporation
+ * Copyright (C) 2019-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -180,7 +180,7 @@ bool check_metric_type_ip(zet_metric_group_handle_t metricGroupHandle,
     MetricProp.pNext = nullptr;
     EXPECT_EQ(ZE_RESULT_SUCCESS, zetMetricGetProperties(metric, &MetricProp));
 
-    if (MetricProp.metricType == ZET_METRIC_TYPE_IP_EXP && !includeExpFeature) {
+    if (MetricProp.metricType == ZET_METRIC_TYPE_IP && !includeExpFeature) {
       return true;
     }
   }
@@ -284,7 +284,7 @@ get_metric_group_info(ze_device_handle_t device,
 
     if (check_metric_type_ip(metricGroupHandle, includeExpFeature)) {
       LOG_WARNING
-          << "Test includes ZET_METRIC_TYPE_IP_EXP Metric Type - Skipped...";
+          << "Test includes ZET_METRIC_TYPE_IP Metric Type - Skipped...";
       continue;
     }
 
@@ -355,7 +355,7 @@ get_metric_group_name_list(ze_device_handle_t device,
     if (check_metric_type_ip(device, strItem, samplingType,
                              includeExpFeature)) {
       LOG_WARNING
-          << "Test includes ZET_METRIC_TYPE_IP_EXP Metric Type - Skipped...";
+          << "Test includes ZET_METRIC_TYPE_IP Metric Type - Skipped...";
       continue;
     }
     groupPropName.push_back(strItem);
@@ -468,10 +468,12 @@ metric_query_create(zet_metric_query_pool_handle_t metricQueryPoolHandle) {
 }
 
 void destroy_metric_query(zet_metric_query_handle_t metricQueryHandle) {
+  ASSERT_NE(nullptr, metricQueryHandle);
   EXPECT_EQ(ZE_RESULT_SUCCESS, zetMetricQueryDestroy(metricQueryHandle));
 }
 
 void reset_metric_query(zet_metric_query_handle_t &metricQueryHandle) {
+  ASSERT_NE(nullptr, metricQueryHandle);
   EXPECT_EQ(ZE_RESULT_SUCCESS, zetMetricQueryReset(metricQueryHandle));
 }
 
@@ -514,8 +516,8 @@ metric_streamer_open(zet_metric_group_handle_t matchedGroupHandle,
 
 zet_metric_streamer_handle_t metric_streamer_open_for_device(
     ze_device_handle_t device, zet_metric_group_handle_t matchedGroupHandle,
-    ze_event_handle_t eventHandle, uint32_t notifyEveryNReports,
-    uint32_t samplingPeriod) {
+    ze_event_handle_t eventHandle, uint32_t &notifyEveryNReports,
+    uint32_t &samplingPeriod) {
   zet_metric_streamer_handle_t metricStreamerHandle = nullptr;
   zet_metric_streamer_desc_t metricStreamerDesc = {
       ZET_STRUCTURE_TYPE_METRIC_STREAMER_DESC, nullptr, notifyEveryNReports,
@@ -525,15 +527,16 @@ zet_metric_streamer_handle_t metric_streamer_open_for_device(
                                   matchedGroupHandle, &metricStreamerDesc,
                                   eventHandle, &metricStreamerHandle));
   EXPECT_NE(nullptr, metricStreamerHandle);
+  notifyEveryNReports = metricStreamerDesc.notifyEveryNReports;
+  samplingPeriod = metricStreamerDesc.samplingPeriod;
   return metricStreamerHandle;
 }
 
-void commandlist_append_streamer_marker(
+ze_result_t commandlist_append_streamer_marker(
     zet_command_list_handle_t commandList,
     zet_metric_streamer_handle_t metricStreamerHandle, uint32_t tracerMarker) {
-  EXPECT_EQ(ZE_RESULT_SUCCESS,
-            zetCommandListAppendMetricStreamerMarker(
-                commandList, metricStreamerHandle, tracerMarker));
+  return zetCommandListAppendMetricStreamerMarker(
+      commandList, metricStreamerHandle, tracerMarker);
 }
 
 size_t metric_streamer_read_data_size(
@@ -579,12 +582,15 @@ void metric_streamer_read_data(
   rawDataSize = metricSize;
 }
 
-void activate_metric_groups(ze_device_handle_t device, uint32_t count,
-                            zet_metric_group_handle_t *matchedGroupHandle) {
+void activate_metric_groups(
+    ze_device_handle_t device, uint32_t count,
+    zet_metric_group_handle_t *ptr_matched_group_handle) {
+  ASSERT_NE(nullptr, *ptr_matched_group_handle);
   EXPECT_EQ(ZE_RESULT_SUCCESS,
             zetContextActivateMetricGroups(lzt::get_default_context(), device,
-                                           count, matchedGroupHandle));
+                                           count, ptr_matched_group_handle));
 }
+
 void deactivate_metric_groups(ze_device_handle_t device) {
   EXPECT_EQ(ZE_RESULT_SUCCESS,
             zetContextActivateMetricGroups(lzt::get_default_context(), device,
@@ -593,6 +599,7 @@ void deactivate_metric_groups(ze_device_handle_t device) {
 
 void append_metric_query_begin(zet_command_list_handle_t commandList,
                                zet_metric_query_handle_t metricQueryHandle) {
+  ASSERT_NE(nullptr, metricQueryHandle);
   EXPECT_EQ(ZE_RESULT_SUCCESS, zetCommandListAppendMetricQueryBegin(
                                    commandList, metricQueryHandle));
 }
@@ -600,6 +607,7 @@ void append_metric_query_begin(zet_command_list_handle_t commandList,
 void append_metric_query_end(zet_command_list_handle_t commandList,
                              zet_metric_query_handle_t metricQueryHandle,
                              ze_event_handle_t eventHandle) {
+  ASSERT_NE(nullptr, metricQueryHandle);
   append_metric_query_end(commandList, metricQueryHandle, eventHandle, 0,
                           nullptr);
 }
@@ -609,6 +617,7 @@ void append_metric_query_end(zet_command_list_handle_t commandList,
                              ze_event_handle_t eventHandle,
                              uint32_t numWaitEvents,
                              ze_event_handle_t *waitEvents) {
+  ASSERT_NE(nullptr, metricQueryHandle);
   EXPECT_EQ(ZE_RESULT_SUCCESS, zetCommandListAppendMetricQueryEnd(
                                    commandList, metricQueryHandle, eventHandle,
                                    numWaitEvents, waitEvents));
@@ -839,7 +848,7 @@ bool verify_metric_type(zet_metric_type_t metric_type) {
   case zet_metric_type_t::ZET_METRIC_TYPE_FLAG:
   case zet_metric_type_t::ZET_METRIC_TYPE_RATIO:
   case zet_metric_type_t::ZET_METRIC_TYPE_RAW:
-  case zet_metric_type_t::ZET_METRIC_TYPE_IP_EXP:
+  case zet_metric_type_t::ZET_METRIC_TYPE_IP:
     break;
   default:
     metric_type_is_valid = false;

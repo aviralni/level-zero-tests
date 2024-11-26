@@ -1,6 +1,6 @@
 /*
  *
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -32,6 +32,7 @@ namespace bi = boost::interprocess;
 
 namespace {
 
+static constexpr uint32_t nanoSecToSeconds = 1000000000;
 class zetMetricGroupTest : public ::testing::Test {
 protected:
   ze_device_handle_t device = lzt::zeDevice::get_instance()->get_device();
@@ -398,9 +399,11 @@ TEST_F(
     for (auto &test_metric_group : test_metric_groups) {
 
       lzt::activate_metric_groups(deviceh, 1, &test_metric_group);
+      uint32_t notifyEveryNReports = 100;
+      uint32_t samplingPeriod = 100000;
       zet_metric_streamer_handle_t metric_streamer_handle =
           lzt::metric_streamer_open_for_device(deviceh, test_metric_group,
-                                               nullptr, 100, 100000);
+                                               nullptr, notifyEveryNReports, samplingPeriod);
       auto report_size =
           lzt::metric_streamer_read_data_size(metric_streamer_handle, 1);
       lzt::metric_streamer_close(metric_streamer_handle);
@@ -432,30 +435,35 @@ TEST_F(
 
 class zetMetricQueryTest : public zetMetricGroupTest {
 protected:
-  zet_metric_query_pool_handle_t metricQueryPoolHandle;
-  zet_metric_query_handle_t metricQueryHandle;
+  zet_metric_query_pool_handle_t metricQueryPoolHandle{};
+  zet_metric_query_handle_t metricQueryHandle{};
 
   std::vector<std::string> groupNameList;
-  zet_metric_group_handle_t matchedGroupHandle;
+  zet_metric_group_handle_t matchedGroupHandle{};
   std::string groupName;
 
-  zetMetricQueryTest() {
-
+  void SetUp() override {
     groupNameList = lzt::get_metric_group_name_list(
         device, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED, false);
+    ASSERT_GT(groupNameList.size(), 0u) << "No query metric groups found";
     groupName = groupNameList[0];
 
     matchedGroupHandle = lzt::find_metric_group(
         device, groupName, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED);
-    EXPECT_NE(nullptr, matchedGroupHandle);
+    ASSERT_NE(nullptr, matchedGroupHandle);
     metricQueryPoolHandle = lzt::create_metric_query_pool(
         1000, ZET_METRIC_QUERY_POOL_TYPE_PERFORMANCE, matchedGroupHandle);
-    EXPECT_NE(nullptr, metricQueryPoolHandle);
+    ASSERT_NE(nullptr, metricQueryPoolHandle);
     metricQueryHandle = lzt::metric_query_create(metricQueryPoolHandle);
   }
+
   void TearDown() override {
-    lzt::destroy_metric_query(metricQueryHandle);
-    lzt::destroy_metric_query_pool(metricQueryPoolHandle);
+    if (metricQueryHandle != nullptr) {
+      lzt::destroy_metric_query(metricQueryHandle);
+    }
+    if (metricQueryPoolHandle != nullptr) {
+      lzt::destroy_metric_query_pool(metricQueryPoolHandle);
+    }
   }
 };
 
@@ -473,7 +481,6 @@ TEST_F(zetMetricQueryTest,
 TEST_F(
     zetMetricQueryTest,
     GivenOnlyMetricQueryWhenCommandListIsCreatedThenExpectCommandListToExecuteSucessfully) {
-
   zet_command_list_handle_t commandList = lzt::create_command_list();
   lzt::activate_metric_groups(device, 1, &matchedGroupHandle);
   lzt::append_metric_query_begin(commandList, metricQueryHandle);
@@ -535,6 +542,7 @@ TEST_F(
 
     auto metricGroupInfo = lzt::get_metric_group_info(
         device, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED, false);
+    ASSERT_GT(metricGroupInfo.size(), 0u) << "No query metric groups found";
     metricGroupInfo = lzt::optimize_metric_group_info_list(metricGroupInfo);
 
     for (auto groupInfo : metricGroupInfo) {
@@ -629,6 +637,7 @@ void run_test(const ze_device_handle_t &device,
   }
   auto metricGroupInfo = lzt::get_metric_group_info(
       device, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED, false);
+  ASSERT_GT(metricGroupInfo.size(), 0u) << "No query metric groups found";
   metricGroupInfo =
       lzt::optimize_metric_group_info_list(metricGroupInfo, reset ? 1 : 20);
 
@@ -802,8 +811,10 @@ void run_multi_device_query_load_test(
 
   auto metric_group_info_0 = lzt::get_metric_group_info(
       device_0, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED, true);
+  ASSERT_GT(metric_group_info_0.size(), 0u) << "No query metric groups found";
   auto metric_group_info_1 = lzt::get_metric_group_info(
       device_1, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED, true);
+  ASSERT_GT(metric_group_info_1.size(), 0u) << "No query metric groups found";
 
   metric_group_info_0 =
       lzt::optimize_metric_group_info_list(metric_group_info_0);
@@ -970,6 +981,7 @@ TEST_F(
 
     auto metricGroupInfo = lzt::get_metric_group_info(
         device, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED, false);
+    ASSERT_GT(metricGroupInfo.size(), 0u) << "No query metric groups found";
     metricGroupInfo = lzt::optimize_metric_group_info_list(metricGroupInfo, 1);
 
     for (auto groupInfo : metricGroupInfo) {
@@ -1222,6 +1234,7 @@ TEST_F(
     zetMetricStreamerTest,
     GivenValidMetricGroupWhenTimerBasedStreamerIsCreatedThenExpectStreamerToSucceed) {
 
+  notifyEveryNReports = 9000;
   for (auto device : devices) {
 
     ze_device_properties_t deviceProperties = {
@@ -1307,6 +1320,201 @@ TEST_F(
       eventPool.destroy_event(eventHandle);
       lzt::reset_command_list(commandList);
     }
+    lzt::destroy_command_queue(commandQueue);
+    lzt::destroy_command_list(commandList);
+  }
+}
+
+TEST_F(
+    zetMetricStreamerTest,
+    GivenValidMetricGroupWhenTimerBasedStreamerIsCreatedThenExpectStreamerToNotifyEventAtProperTimeAndSucceed) {
+  /* This test computes the expected time before which events are generated by multiplying notifyEveryNReports and samplingPeriod.
+   * It then loops inside the do-while loop for the expected time and checks for event status to be ZE_RESULT_NOT_READY.
+   * Once the expected time has elapsed it will come out of the loop and expect the event to be generated.
+   */
+
+  uint32_t notifyEveryNReports = 1000;
+  uint32_t samplingPeriod = 50000000;
+  for (auto device : devices) {
+
+    ze_device_properties_t deviceProperties = {
+        ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES, nullptr};
+    zeDeviceGetProperties(device, &deviceProperties);
+
+    LOG_INFO << "test device name " << deviceProperties.name << " uuid "
+             << lzt::to_string(deviceProperties.uuid);
+    if (deviceProperties.flags & ZE_DEVICE_PROPERTY_FLAG_SUBDEVICE) {
+      LOG_INFO << "test subdevice id " << deviceProperties.subdeviceId;
+    } else {
+      LOG_INFO << "test device is a root device";
+    }
+
+    ze_command_queue_handle_t commandQueue = lzt::create_command_queue(device);
+    zet_command_list_handle_t commandList = lzt::create_command_list(device);
+
+    auto metricGroupInfo = lzt::get_metric_group_info(
+        device, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED, true);
+    metricGroupInfo = lzt::optimize_metric_group_info_list(metricGroupInfo);
+
+    void *a_buffer, *b_buffer, *c_buffer;
+    ze_group_count_t tg;
+    ze_kernel_handle_t function = get_matrix_multiplication_kernel(
+        device, &tg, &a_buffer, &b_buffer, &c_buffer, 8192);
+    zeCommandListAppendLaunchKernel(commandList, function, &tg, nullptr, 0,
+                                    nullptr);
+    lzt::close_command_list(commandList);
+
+    for (auto groupInfo : metricGroupInfo) {
+      LOG_INFO << "test metricGroup name " << groupInfo.metricGroupName;
+      lzt::activate_metric_groups(device, 1, &groupInfo.metricGroupHandle);
+
+      ze_event_handle_t eventHandle;
+      lzt::zeEventPool eventPool;
+      eventPool.create_event(eventHandle, ZE_EVENT_SCOPE_FLAG_HOST,
+                              ZE_EVENT_SCOPE_FLAG_HOST);      
+
+      auto startTime = std::chrono::system_clock::now();
+      zet_metric_streamer_handle_t metricStreamerHandle =
+          lzt::metric_streamer_open_for_device(
+              device, groupInfo.metricGroupHandle, eventHandle,
+              notifyEveryNReports, samplingPeriod);
+      ASSERT_NE(nullptr, metricStreamerHandle);
+
+      lzt::execute_command_lists(commandQueue, 1, &commandList, nullptr);
+      lzt::synchronize(commandQueue, std::numeric_limits<uint64_t>::max());
+
+      double minimumTimeBeforeEventIsExpected = notifyEveryNReports * (static_cast<double>(samplingPeriod) / nanoSecToSeconds);
+      // Initializing a 10% error buffer to prevent corner cases 
+      double errorBuffer = 0.05 * minimumTimeBeforeEventIsExpected;
+      LOG_DEBUG << "minimumTimeBeforeEventIsExpected " << minimumTimeBeforeEventIsExpected;
+      LOG_DEBUG << "errorBuffer " << errorBuffer;
+      
+      ze_result_t eventResult;
+      auto currentTime = std::chrono::system_clock::now();
+      std::chrono::duration<double> elapsedSeconds = currentTime - startTime;
+
+      while (elapsedSeconds.count() < (minimumTimeBeforeEventIsExpected - errorBuffer)) {
+        eventResult = zeEventQueryStatus(eventHandle);
+        EXPECT_EQ(eventResult, ZE_RESULT_NOT_READY);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        currentTime = std::chrono::system_clock::now();
+        elapsedSeconds = currentTime - startTime;
+      }
+
+      // Sleep again for the error buffer time to ensure corner cases are avoided.
+      uint32_t sleep = std::ceil(2 * errorBuffer);
+      LOG_DEBUG << "additional sleep before expecting event to be ready " << sleep;
+      std::this_thread::sleep_for(std::chrono::seconds(sleep));
+
+      eventResult = zeEventQueryStatus(eventHandle);
+      EXPECT_EQ(eventResult, ZE_RESULT_SUCCESS);
+
+      lzt::metric_streamer_close(metricStreamerHandle);
+      lzt::deactivate_metric_groups(device);
+      eventPool.destroy_event(eventHandle);     
+    }
+    lzt::destroy_function(function);
+    lzt::free_memory(a_buffer);
+    lzt::free_memory(b_buffer);
+    lzt::free_memory(c_buffer);
+    lzt::reset_command_list(commandList);
+    lzt::destroy_command_queue(commandQueue);
+    lzt::destroy_command_list(commandList);
+  }
+}
+
+TEST_F(
+    zetMetricStreamerTest,
+    GivenValidMetricGroupWhenTimerBasedStreamerIsCreatedThenExpectStreamerToGenrateCorrectNumberOfReports) {
+
+  uint32_t notifyEveryNReports = 1000;
+  uint32_t samplingPeriod = 50000000;
+  for (auto device : devices) {
+
+    ze_device_properties_t deviceProperties = {
+        ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES, nullptr};
+    zeDeviceGetProperties(device, &deviceProperties);
+
+    LOG_INFO << "test device name " << deviceProperties.name << " uuid "
+             << lzt::to_string(deviceProperties.uuid);
+    if (deviceProperties.flags & ZE_DEVICE_PROPERTY_FLAG_SUBDEVICE) {
+      LOG_INFO << "test subdevice id " << deviceProperties.subdeviceId;
+    } else {
+      LOG_INFO << "test device is a root device";
+    }
+
+    auto metricGroupInfo = lzt::get_metric_group_info(
+        device, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED, true);
+    metricGroupInfo = lzt::optimize_metric_group_info_list(metricGroupInfo);
+    
+    void *a_buffer, *b_buffer, *c_buffer;
+    ze_group_count_t tg;
+    ze_command_queue_handle_t commandQueue = lzt::create_command_queue(device);
+    zet_command_list_handle_t commandList = lzt::create_command_list(device);
+
+    ze_kernel_handle_t function = get_matrix_multiplication_kernel(
+        device, &tg, &a_buffer, &b_buffer, &c_buffer, 8192);
+    zeCommandListAppendLaunchKernel(commandList, function, &tg, nullptr, 0,
+                                    nullptr);
+    lzt::close_command_list(commandList);
+
+    for (auto groupInfo : metricGroupInfo) {
+      LOG_INFO << "test metricGroup name " << groupInfo.metricGroupName;
+      lzt::activate_metric_groups(device, 1, &groupInfo.metricGroupHandle);
+
+      ze_event_handle_t eventHandle;
+      lzt::zeEventPool eventPool;
+      eventPool.create_event(eventHandle, ZE_EVENT_SCOPE_FLAG_HOST,
+                              ZE_EVENT_SCOPE_FLAG_HOST);      
+
+      auto startTime = std::chrono::system_clock::now();
+      zet_metric_streamer_handle_t metricStreamerHandle =
+          lzt::metric_streamer_open_for_device(
+              device, groupInfo.metricGroupHandle, eventHandle,
+              notifyEveryNReports, samplingPeriod);
+      ASSERT_NE(nullptr, metricStreamerHandle);
+
+      lzt::execute_command_lists(commandQueue, 1, &commandList, nullptr);
+      lzt::synchronize(commandQueue, std::numeric_limits<uint64_t>::max());
+
+      double minimumTimeBeforeEventIsExpected = notifyEveryNReports * (static_cast<double>(samplingPeriod) / nanoSecToSeconds);
+      // Initializing a 5% error buffer to prevent corner cases 
+      double errorBuffer = 0.05 * minimumTimeBeforeEventIsExpected;
+      LOG_DEBUG << "minimumTimeBeforeEventIsExpected " << minimumTimeBeforeEventIsExpected;
+      LOG_DEBUG << "errorBuffer " << errorBuffer;      
+      
+      // Sleep until event is generated.
+      auto currentTime = std::chrono::system_clock::now();
+      std::chrono::duration<double> elapsedSeconds = currentTime - startTime;
+      int32_t timeLeft = std::ceil(minimumTimeBeforeEventIsExpected + errorBuffer - elapsedSeconds.count());
+      if (timeLeft > 0) {
+        LOG_DEBUG << "additional sleep before expecting event to be ready " << timeLeft;
+        std::this_thread::sleep_for(std::chrono::seconds(timeLeft));
+      }
+
+      ze_result_t eventResult;
+      eventResult = zeEventQueryStatus(eventHandle);
+      EXPECT_EQ(eventResult, ZE_RESULT_SUCCESS);
+
+      size_t oneReportSize, allReportsSize;
+      oneReportSize =
+          lzt::metric_streamer_read_data_size(metricStreamerHandle, 1);
+      allReportsSize = lzt::metric_streamer_read_data_size(
+          metricStreamerHandle, UINT32_MAX);
+      LOG_DEBUG << "Event triggered. Single report size: " << oneReportSize
+                << ". All reports size:" << allReportsSize;
+
+      EXPECT_GE(allReportsSize / oneReportSize, notifyEveryNReports);
+
+      lzt::metric_streamer_close(metricStreamerHandle);
+      lzt::deactivate_metric_groups(device);
+      eventPool.destroy_event(eventHandle);      
+    }
+    lzt::destroy_function(function);
+    lzt::free_memory(a_buffer);
+    lzt::free_memory(b_buffer);
+    lzt::free_memory(c_buffer);
+    lzt::reset_command_list(commandList);
     lzt::destroy_command_queue(commandQueue);
     lzt::destroy_command_list(commandList);
   }
@@ -1681,14 +1889,17 @@ TEST_F(
         device, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED, false);
     metricGroupInfo = lzt::optimize_metric_group_info_list(metricGroupInfo);
 
+    uint32_t markerGroupCount{};
+
     for (auto groupInfo : metricGroupInfo) {
 
       LOG_INFO << "test metricGroup name " << groupInfo.metricGroupName;
 
       lzt::activate_metric_groups(device, 1, &groupInfo.metricGroupHandle);
 
-      ze_event_handle_t eventHandle;
-      lzt::zeEventPool eventPool;
+      ze_event_handle_t eventHandle{};
+      lzt::zeEventPool eventPool{};
+      ze_result_t markerResult;
       eventPool.create_event(eventHandle, ZE_EVENT_SCOPE_FLAG_HOST,
                              ZE_EVENT_SCOPE_FLAG_HOST);
 
@@ -1699,45 +1910,55 @@ TEST_F(
       ASSERT_NE(nullptr, metricStreamerHandle);
 
       void *a_buffer, *b_buffer, *c_buffer;
-      ze_group_count_t tg;
+      ze_group_count_t tg{};
       ze_kernel_handle_t function = get_matrix_multiplication_kernel(
           device, &tg, &a_buffer, &b_buffer, &c_buffer);
-      zeCommandListAppendLaunchKernel(commandList, function, &tg, nullptr, 0,
-                                      nullptr);
 
       uint32_t streamerMarker = 0;
-      lzt::commandlist_append_streamer_marker(commandList, metricStreamerHandle,
-                                              ++streamerMarker);
+      markerResult = lzt::commandlist_append_streamer_marker(
+          commandList, metricStreamerHandle, ++streamerMarker);
       lzt::append_barrier(commandList);
-      lzt::commandlist_append_streamer_marker(commandList, metricStreamerHandle,
-                                              ++streamerMarker);
 
-      lzt::close_command_list(commandList);
-      lzt::execute_command_lists(commandQueue, 1, &commandList, nullptr);
-      lzt::synchronize(commandQueue, std::numeric_limits<uint64_t>::max());
-      ze_result_t eventResult;
-      eventResult = zeEventQueryStatus(eventHandle);
+      if (ZE_RESULT_SUCCESS == markerResult) {
+        markerGroupCount++;
+        zeCommandListAppendLaunchKernel(commandList, function, &tg, nullptr, 0,
+                                        nullptr);
+        lzt::append_barrier(commandList);
+        markerResult = lzt::commandlist_append_streamer_marker(
+            commandList, metricStreamerHandle, ++streamerMarker);
+        lzt::append_barrier(commandList);
+        lzt::close_command_list(commandList);
+        lzt::execute_command_lists(commandQueue, 1, &commandList, nullptr);
+        lzt::synchronize(commandQueue, std::numeric_limits<uint64_t>::max());
+        ze_result_t eventResult;
+        eventResult = zeEventQueryStatus(eventHandle);
 
-      if (ZE_RESULT_SUCCESS == eventResult) {
-        size_t oneReportSize, allReportsSize;
-        oneReportSize =
-            lzt::metric_streamer_read_data_size(metricStreamerHandle, 1);
-        allReportsSize = lzt::metric_streamer_read_data_size(
-            metricStreamerHandle, UINT32_MAX);
-        LOG_DEBUG << "Event triggered. Single report size: " << oneReportSize
-                  << ". All reports size:" << allReportsSize;
+        if (ZE_RESULT_SUCCESS == eventResult) {
+          size_t oneReportSize, allReportsSize;
+          oneReportSize =
+              lzt::metric_streamer_read_data_size(metricStreamerHandle, 1);
+          allReportsSize = lzt::metric_streamer_read_data_size(
+              metricStreamerHandle, UINT32_MAX);
+          LOG_DEBUG << "Event triggered. Single report size: " << oneReportSize
+                    << ". All reports size:" << allReportsSize;
 
-        EXPECT_GE(allReportsSize / oneReportSize, notifyEveryNReports);
+          EXPECT_GE(allReportsSize / oneReportSize, notifyEveryNReports);
 
-      } else if (ZE_RESULT_NOT_READY == eventResult) {
-        LOG_WARNING << "wait on event returned ZE_RESULT_NOT_READY";
+        } else if (ZE_RESULT_NOT_READY == eventResult) {
+          LOG_WARNING << "wait on event returned ZE_RESULT_NOT_READY";
+        } else {
+          FAIL() << "zeEventQueryStatus() FAILED with " << eventResult;
+        }
+
+        std::vector<uint8_t> rawData;
+        lzt::metric_streamer_read_data(metricStreamerHandle, &rawData);
+      } else if (ZE_RESULT_ERROR_UNSUPPORTED_FEATURE == markerResult) {
+        LOG_INFO << "metricGroup " << groupInfo.metricGroupName
+                 << " doesn't support streamer marker";
       } else {
-        FAIL() << "zeEventQueryStatus() FAILED with " << eventResult;
+        FAIL() << "zetCommandListAppendMetricStreamerMarker() FAILED with "
+               << markerResult;
       }
-
-      std::vector<uint8_t> rawData;
-      lzt::metric_streamer_read_data(metricStreamerHandle, &rawData);
-
       lzt::metric_streamer_close(metricStreamerHandle);
       lzt::deactivate_metric_groups(device);
       lzt::destroy_function(function);
@@ -1749,6 +1970,7 @@ TEST_F(
     }
     lzt::destroy_command_queue(commandQueue);
     lzt::destroy_command_list(commandList);
+    EXPECT_NE(0, markerGroupCount);
   }
 }
 
@@ -1779,6 +2001,8 @@ TEST_F(
         device, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED, false);
     metricGroupInfo = lzt::optimize_metric_group_info_list(metricGroupInfo);
 
+    uint32_t markerGroupCount{};
+
     for (auto groupInfo : metricGroupInfo) {
 
       LOG_INFO << "test metricGroup name " << groupInfo.metricGroupName;
@@ -1787,8 +2011,9 @@ TEST_F(
 
       lzt::activate_metric_groups(device, 1, &groupInfo.metricGroupHandle);
 
-      ze_event_handle_t eventHandle;
-      lzt::zeEventPool eventPool;
+      ze_event_handle_t eventHandle{};
+      lzt::zeEventPool eventPool{};
+      ze_result_t markerResult;
       eventPool.create_event(eventHandle, ZE_EVENT_SCOPE_FLAG_HOST,
                              ZE_EVENT_SCOPE_FLAG_HOST);
 
@@ -1798,68 +2023,76 @@ TEST_F(
               notifyEveryNReports, samplingPeriod);
       ASSERT_NE(nullptr, metricStreamerHandle);
 
-      lzt::commandlist_append_streamer_marker(commandList, metricStreamerHandle,
-                                              streamerMarkerValues[0]);
-      lzt::append_barrier(commandList);
-
       void *a_buffer, *b_buffer, *c_buffer;
-      ze_group_count_t tg;
+      ze_group_count_t tg{};
       ze_kernel_handle_t function = get_matrix_multiplication_kernel(
           device, &tg, &a_buffer, &b_buffer, &c_buffer);
-      zeCommandListAppendLaunchKernel(commandList, function, &tg, nullptr, 0,
-                                      nullptr);
+
+      markerResult = lzt::commandlist_append_streamer_marker(
+          commandList, metricStreamerHandle, streamerMarkerValues[0]);
       lzt::append_barrier(commandList);
 
-      lzt::commandlist_append_streamer_marker(commandList, metricStreamerHandle,
-                                              streamerMarkerValues[1]);
-      lzt::append_barrier(commandList);
+      if (ZE_RESULT_SUCCESS == markerResult) {
+        markerGroupCount++;
+        zeCommandListAppendLaunchKernel(commandList, function, &tg, nullptr, 0,
+                                        nullptr);
+        lzt::append_barrier(commandList);
+        markerResult = lzt::commandlist_append_streamer_marker(
+            commandList, metricStreamerHandle, streamerMarkerValues[1]);
+        lzt::append_barrier(commandList);
+        lzt::close_command_list(commandList);
+        lzt::execute_command_lists(commandQueue, 1, &commandList, nullptr);
+        lzt::synchronize(commandQueue, std::numeric_limits<uint64_t>::max());
+        ze_result_t eventResult;
+        eventResult = zeEventQueryStatus(eventHandle);
 
-      lzt::close_command_list(commandList);
-      lzt::execute_command_lists(commandQueue, 1, &commandList, nullptr);
-      lzt::synchronize(commandQueue, std::numeric_limits<uint64_t>::max());
-      ze_result_t eventResult;
-      eventResult = zeEventQueryStatus(eventHandle);
+        if (ZE_RESULT_SUCCESS == eventResult) {
+          size_t oneReportSize, allReportsSize;
+          oneReportSize =
+              lzt::metric_streamer_read_data_size(metricStreamerHandle, 1);
+          allReportsSize = lzt::metric_streamer_read_data_size(
+              metricStreamerHandle, UINT32_MAX);
+          LOG_DEBUG << "Event triggered. Single report size: " << oneReportSize
+                    << ". All reports size:" << allReportsSize;
 
-      if (ZE_RESULT_SUCCESS == eventResult) {
-        size_t oneReportSize, allReportsSize;
-        oneReportSize =
-            lzt::metric_streamer_read_data_size(metricStreamerHandle, 1);
-        allReportsSize = lzt::metric_streamer_read_data_size(
-            metricStreamerHandle, UINT32_MAX);
-        LOG_DEBUG << "Event triggered. Single report size: " << oneReportSize
-                  << ". All reports size:" << allReportsSize;
+          EXPECT_GE(allReportsSize / oneReportSize, notifyEveryNReports);
 
-        EXPECT_GE(allReportsSize / oneReportSize, notifyEveryNReports);
+        } else if (ZE_RESULT_NOT_READY == eventResult) {
+          LOG_WARNING << "wait on event returned ZE_RESULT_NOT_READY";
+        } else {
+          FAIL() << "zeEventQueryStatus() FAILED with " << eventResult;
+        }
 
-      } else if (ZE_RESULT_NOT_READY == eventResult) {
-        LOG_WARNING << "wait on event returned ZE_RESULT_NOT_READY";
+        std::vector<uint8_t> rawData;
+        uint32_t rawDataSize = 0;
+        lzt::metric_streamer_read_data(metricStreamerHandle, rawDataSize,
+                                       &rawData);
+
+        rawData.resize(rawDataSize);
+        std::vector<zet_typed_value_t> metricValues;
+        std::vector<uint32_t> metricValueSets;
+        lzt::metric_calculate_metric_values_from_raw_data(
+            groupInfo.metricGroupHandle, rawData, metricValues,
+            metricValueSets);
+
+        std::vector<zet_metric_handle_t> metricHandles;
+        lzt::metric_get_metric_handles_from_metric_group(
+            groupInfo.metricGroupHandle, metricHandles);
+        std::vector<zet_metric_properties_t> metricProperties(
+            metricHandles.size());
+        lzt::metric_get_metric_properties_for_metric_group(metricHandles,
+                                                           metricProperties);
+
+        lzt::metric_validate_streamer_marker_data(metricProperties,
+                                                  metricValues, metricValueSets,
+                                                  streamerMarkerValues);
+      } else if (ZE_RESULT_ERROR_UNSUPPORTED_FEATURE == markerResult) {
+        LOG_INFO << "metricGroup " << groupInfo.metricGroupName
+                 << " doesn't support streamer marker";
       } else {
-        FAIL() << "zeEventQueryStatus() FAILED with " << eventResult;
+        FAIL() << "zetCommandListAppendMetricStreamerMarker() FAILED with "
+               << markerResult;
       }
-
-      std::vector<uint8_t> rawData;
-      uint32_t rawDataSize = 0;
-      lzt::metric_streamer_read_data(metricStreamerHandle, rawDataSize,
-                                     &rawData);
-
-      rawData.resize(rawDataSize);
-      std::vector<zet_typed_value_t> metricValues;
-      std::vector<uint32_t> metricValueSets;
-      lzt::metric_calculate_metric_values_from_raw_data(
-          groupInfo.metricGroupHandle, rawData, metricValues, metricValueSets);
-
-      std::vector<zet_metric_handle_t> metricHandles;
-      lzt::metric_get_metric_handles_from_metric_group(
-          groupInfo.metricGroupHandle, metricHandles);
-      std::vector<zet_metric_properties_t> metricProperties(
-          metricHandles.size());
-      lzt::metric_get_metric_properties_for_metric_group(metricHandles,
-                                                         metricProperties);
-
-      lzt::metric_validate_streamer_marker_data(metricProperties, metricValues,
-                                                metricValueSets,
-                                                streamerMarkerValues);
-
       lzt::metric_streamer_close(metricStreamerHandle);
       lzt::deactivate_metric_groups(device);
       lzt::destroy_function(function);
@@ -1871,6 +2104,7 @@ TEST_F(
     }
     lzt::destroy_command_queue(commandQueue);
     lzt::destroy_command_list(commandList);
+    EXPECT_NE(0, markerGroupCount);
   }
 }
 
@@ -1917,14 +2151,17 @@ TEST_F(
         device, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED, false);
     metricGroupInfo = lzt::optimize_metric_group_info_list(metricGroupInfo, 1);
 
+    uint32_t markerGroupCount{};
+
     for (auto groupInfo : metricGroupInfo) {
 
       LOG_INFO << "test metricGroup name " << groupInfo.metricGroupName;
 
       lzt::activate_metric_groups(device, 1, &groupInfo.metricGroupHandle);
 
-      ze_event_handle_t eventHandle;
-      lzt::zeEventPool eventPool;
+      ze_event_handle_t eventHandle{};
+      lzt::zeEventPool eventPool{};
+      ze_result_t markerResult;
       eventPool.create_event(eventHandle, ZE_EVENT_SCOPE_FLAG_HOST,
                              ZE_EVENT_SCOPE_FLAG_HOST);
 
@@ -1935,49 +2172,58 @@ TEST_F(
       ASSERT_NE(nullptr, metricStreamerHandle);
 
       void *a_buffer, *b_buffer, *c_buffer;
-      ze_group_count_t tg;
+      ze_group_count_t tg{};
       ze_kernel_handle_t function = get_matrix_multiplication_kernel(
           device, &tg, &a_buffer, &b_buffer, &c_buffer);
-      zeCommandListAppendLaunchKernel(commandList, function, &tg, nullptr, 0,
-                                      nullptr);
 
       uint32_t streamerMarker = 0;
-      lzt::commandlist_append_streamer_marker(commandList, metricStreamerHandle,
-                                              ++streamerMarker);
-      lzt::append_barrier(commandList);
-      lzt::commandlist_append_streamer_marker(commandList, metricStreamerHandle,
-                                              ++streamerMarker);
+      markerResult = lzt::commandlist_append_streamer_marker(
+          commandList, metricStreamerHandle, ++streamerMarker);
 
-      lzt::close_command_list(commandList);
-      lzt::execute_command_lists(commandQueue, 1, &commandList, nullptr);
-      lzt::synchronize(commandQueue, std::numeric_limits<uint64_t>::max());
-      ze_result_t eventResult;
-      eventResult = zeEventQueryStatus(eventHandle);
+      if (ZE_RESULT_SUCCESS == markerResult) {
+        markerGroupCount++;
+        zeCommandListAppendLaunchKernel(commandList, function, &tg, nullptr, 0,
+                                        nullptr);
+        lzt::append_barrier(commandList);
+        markerResult = lzt::commandlist_append_streamer_marker(
+            commandList, metricStreamerHandle, ++streamerMarker);
+        lzt::append_barrier(commandList);
+        lzt::close_command_list(commandList);
+        lzt::execute_command_lists(commandQueue, 1, &commandList, nullptr);
+        lzt::synchronize(commandQueue, std::numeric_limits<uint64_t>::max());
+        ze_result_t eventResult;
+        eventResult = zeEventQueryStatus(eventHandle);
 
-      if (ZE_RESULT_SUCCESS == eventResult) {
-        size_t oneReportSize, allReportsSize;
-        oneReportSize =
-            lzt::metric_streamer_read_data_size(metricStreamerHandle, 1);
-        allReportsSize = lzt::metric_streamer_read_data_size(
-            metricStreamerHandle, UINT32_MAX);
-        LOG_DEBUG << "Event triggered. Single report size: " << oneReportSize
-                  << ". All reports size:" << allReportsSize;
+        if (ZE_RESULT_SUCCESS == eventResult) {
+          size_t oneReportSize, allReportsSize;
+          oneReportSize =
+              lzt::metric_streamer_read_data_size(metricStreamerHandle, 1);
+          allReportsSize = lzt::metric_streamer_read_data_size(
+              metricStreamerHandle, UINT32_MAX);
+          LOG_DEBUG << "Event triggered. Single report size: " << oneReportSize
+                    << ". All reports size:" << allReportsSize;
 
-        EXPECT_GE(allReportsSize / oneReportSize, notifyEveryNReports);
+          EXPECT_GE(allReportsSize / oneReportSize, notifyEveryNReports);
 
-      } else if (ZE_RESULT_NOT_READY == eventResult) {
-        LOG_WARNING << "wait on event returned ZE_RESULT_NOT_READY";
+        } else if (ZE_RESULT_NOT_READY == eventResult) {
+          LOG_WARNING << "wait on event returned ZE_RESULT_NOT_READY";
+        } else {
+          FAIL() << "zeEventQueryStatus() FAILED with " << eventResult;
+        }
+
+        std::vector<uint8_t> rawData;
+        uint32_t rawDataSize = 0;
+        lzt::metric_streamer_read_data(metricStreamerHandle, rawDataSize,
+                                       &rawData);
+        lzt::validate_metrics_std(groupInfo.metricGroupHandle, rawDataSize,
+                                  rawData.data());
+      } else if (ZE_RESULT_ERROR_UNSUPPORTED_FEATURE == markerResult) {
+        LOG_INFO << "metricGroup " << groupInfo.metricGroupName
+                 << " doesn't support streamer marker";
       } else {
-        FAIL() << "zeEventQueryStatus() FAILED with " << eventResult;
+        FAIL() << "zetCommandListAppendMetricStreamerMarker() FAILED with "
+               << markerResult;
       }
-
-      std::vector<uint8_t> rawData;
-      uint32_t rawDataSize = 0;
-      lzt::metric_streamer_read_data(metricStreamerHandle, rawDataSize,
-                                     &rawData);
-      lzt::validate_metrics_std(groupInfo.metricGroupHandle, rawDataSize,
-                                rawData.data());
-
       lzt::metric_streamer_close(metricStreamerHandle);
       lzt::deactivate_metric_groups(device);
       lzt::destroy_function(function);
@@ -1989,6 +2235,7 @@ TEST_F(
     }
     lzt::destroy_command_queue(commandQueue);
     lzt::destroy_command_list(commandList);
+    EXPECT_NE(0, markerGroupCount);
   }
 }
 
@@ -2023,7 +2270,7 @@ TEST(
                          ZE_EVENT_SCOPE_FLAG_HOST);
 
   uint32_t notifyEveryNReports = 3000;
-  uint32_t samplingPeriod = 1000000;
+  uint32_t samplingPeriod = 10000;
   zet_metric_streamer_handle_t metricStreamerHandle =
       lzt::metric_streamer_open_for_device(device, groupInfo.metricGroupHandle,
                                            eventHandle, notifyEveryNReports,
@@ -2105,7 +2352,7 @@ TEST(
                          ZE_EVENT_SCOPE_FLAG_HOST);
 
   uint32_t notifyEveryNReports = 3000;
-  uint32_t samplingPeriod = 1000000;
+  uint32_t samplingPeriod = 10000;
   zet_metric_streamer_handle_t metricStreamerHandle =
       lzt::metric_streamer_open_for_device(device, groupInfo.metricGroupHandle,
                                            eventHandle, notifyEveryNReports,
@@ -2191,14 +2438,17 @@ TEST_F(
         device, ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED, false);
     metricGroupInfo = lzt::optimize_metric_group_info_list(metricGroupInfo, 1);
 
+    uint32_t markerGroupCount{};
+
     for (auto groupInfo : metricGroupInfo) {
 
       LOG_INFO << "test metricGroup name " << groupInfo.metricGroupName;
 
       lzt::activate_metric_groups(device, 1, &groupInfo.metricGroupHandle);
 
-      ze_event_handle_t eventHandle;
-      lzt::zeEventPool eventPool;
+      ze_event_handle_t eventHandle{};
+      lzt::zeEventPool eventPool{};
+      ze_result_t markerResult;
       eventPool.create_event(eventHandle, ZE_EVENT_SCOPE_FLAG_HOST,
                              ZE_EVENT_SCOPE_FLAG_HOST);
 
@@ -2209,7 +2459,7 @@ TEST_F(
       ASSERT_NE(nullptr, metricStreamerHandle);
 
       void *a_buffer, *b_buffer, *c_buffer;
-      ze_group_count_t tg;
+      ze_group_count_t tg{};
       auto device_properties = lzt::get_device_properties(device);
       const auto max_threads = device_properties.numSlices *
                                device_properties.numSubslicesPerSlice *
@@ -2227,44 +2477,59 @@ TEST_F(
       const uint32_t max_repeat_count = (dimensions > 2) ? 200 : 1;
       for (uint32_t repeat_count = 0; repeat_count < max_repeat_count;
            repeat_count++) {
+        uint32_t streamerMarker = 0;
+        markerResult = lzt::commandlist_append_streamer_marker(
+            commandList, metricStreamerHandle, ++streamerMarker);
+        lzt::append_barrier(commandList);
+        if (ZE_RESULT_SUCCESS == markerResult) {
+          break;
+        }
         zeCommandListAppendLaunchKernel(commandList, function, &tg, nullptr, 0,
                                         nullptr);
-
         lzt::append_barrier(commandList);
-        uint32_t streamerMarker = 0;
-        lzt::commandlist_append_streamer_marker(
+        markerResult = lzt::commandlist_append_streamer_marker(
             commandList, metricStreamerHandle, ++streamerMarker);
         lzt::append_barrier(commandList);
-        lzt::commandlist_append_streamer_marker(
-            commandList, metricStreamerHandle, ++streamerMarker);
+        if (ZE_RESULT_SUCCESS == markerResult) {
+          break;
+        }
       }
-      ze_result_t eventResult;
-      eventResult = zeEventHostSynchronize(eventHandle, 5000000000);
 
-      if (ZE_RESULT_SUCCESS == eventResult) {
-        size_t oneReportSize, allReportsSize;
-        oneReportSize =
-            lzt::metric_streamer_read_data_size(metricStreamerHandle, 1);
-        allReportsSize = lzt::metric_streamer_read_data_size(
-            metricStreamerHandle, UINT32_MAX);
-        LOG_DEBUG << "Event triggered. Single report size: " << oneReportSize
-                  << ". All reports size:" << allReportsSize;
+      if (ZE_RESULT_SUCCESS == markerResult) {
+        markerGroupCount++;
+        ze_result_t eventResult;
+        eventResult = zeEventHostSynchronize(eventHandle, 5000000000);
 
-        EXPECT_GE(allReportsSize / oneReportSize, notifyEveryNReports);
+        if (ZE_RESULT_SUCCESS == eventResult) {
+          size_t oneReportSize, allReportsSize;
+          oneReportSize =
+              lzt::metric_streamer_read_data_size(metricStreamerHandle, 1);
+          allReportsSize = lzt::metric_streamer_read_data_size(
+              metricStreamerHandle, UINT32_MAX);
+          LOG_DEBUG << "Event triggered. Single report size: " << oneReportSize
+                    << ". All reports size:" << allReportsSize;
 
-      } else if (ZE_RESULT_NOT_READY == eventResult) {
-        LOG_WARNING << "wait on event returned ZE_RESULT_NOT_READY";
+          EXPECT_GE(allReportsSize / oneReportSize, notifyEveryNReports);
+
+        } else if (ZE_RESULT_NOT_READY == eventResult) {
+          LOG_WARNING << "wait on event returned ZE_RESULT_NOT_READY";
+        } else {
+          FAIL() << "zeEventQueryStatus() FAILED with " << eventResult;
+        }
+
+        std::vector<uint8_t> rawData;
+        uint32_t rawDataSize = 0;
+        lzt::metric_streamer_read_data(metricStreamerHandle, rawDataSize,
+                                       &rawData);
+        lzt::validate_metrics(groupInfo.metricGroupHandle, rawDataSize,
+                              rawData.data());
+      } else if (ZE_RESULT_ERROR_UNSUPPORTED_FEATURE == markerResult) {
+        LOG_INFO << "metricGroup " << groupInfo.metricGroupName
+                 << " doesn't support streamer marker";
       } else {
-        FAIL() << "zeEventQueryStatus() FAILED with " << eventResult;
+        FAIL() << "zetCommandListAppendMetricStreamerMarker() FAILED with "
+               << markerResult;
       }
-
-      std::vector<uint8_t> rawData;
-      uint32_t rawDataSize = 0;
-      lzt::metric_streamer_read_data(metricStreamerHandle, rawDataSize,
-                                     &rawData);
-      lzt::validate_metrics(groupInfo.metricGroupHandle, rawDataSize,
-                            rawData.data());
-
       lzt::metric_streamer_close(metricStreamerHandle);
       lzt::deactivate_metric_groups(device);
       lzt::destroy_function(function);
@@ -2275,6 +2540,7 @@ TEST_F(
       lzt::reset_command_list(commandList);
     }
     lzt::destroy_command_list(commandList);
+    EXPECT_NE(0, markerGroupCount);
   }
 }
 
@@ -2321,8 +2587,8 @@ void run_multi_device_streamer_test(
   eventPool.create_event(eventHandle_1, ZE_EVENT_SCOPE_FLAG_HOST,
                          ZE_EVENT_SCOPE_FLAG_HOST);
 
-  auto notifyEveryNReports = 3000;
-  auto samplingPeriod = 1000000;
+  uint32_t notifyEveryNReports = 3000;
+  uint32_t samplingPeriod = 1000000;
   auto metricStreamerHandle_0 = lzt::metric_streamer_open_for_device(
       device_0, groupInfo_0.metricGroupHandle, eventHandle_0,
       notifyEveryNReports, samplingPeriod);
